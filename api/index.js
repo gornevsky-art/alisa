@@ -70,7 +70,7 @@ async function fetchJson(url, options, timeoutMs) {
 }
 
 async function searchWeb(query, timeoutMs) {
-  const key = process.env.SERPER_API_KEY;
+  const key = process.env.SERPER_API_KEY || process.env.SERPER_API;
   if (!key || timeoutMs < 150) return "";
 
   try {
@@ -111,7 +111,7 @@ async function searchWeb(query, timeoutMs) {
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
+  const key = process.env.GEMINI_API_KEY || process.env.GEMINI_API;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
@@ -175,7 +175,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
+      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY или GEMINI_API в настройках Vercel.";
     case "GEMINI_KEY_REJECTED":
       return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
@@ -220,7 +220,7 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    if (isSearchIntent(text) && (process.env.SERPER_API_KEY || process.env.SERPER_API)) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
