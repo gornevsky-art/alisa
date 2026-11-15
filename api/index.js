@@ -3,7 +3,7 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
+const SERPER_TIMEOUT_MS = 1600;
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -62,7 +62,10 @@ async function fetchJson(url, options, timeoutMs) {
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    const data = await response.json().catch(() => ({}));
+    const data = await response.json().catch(error => {
+      if (error?.name === "AbortError") throw error;
+      return {};
+    });
     return { response, data };
   } finally {
     clearTimeout(timer);
@@ -71,10 +74,12 @@ async function fetchJson(url, options, timeoutMs) {
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY || process.env.SERPER_API;
-  if (!key || timeoutMs < 150) return "";
+  if (!key) throw new Error("MISSING_SERPER_KEY");
+  if (timeoutMs < 150) throw new Error("SERPER_TIMEOUT");
 
+  let result;
   try {
-    const { response, data } = await fetchJson(
+    result = await fetchJson(
       "https://google.serper.dev/search",
       {
         method: "POST",
@@ -86,28 +91,33 @@ async function searchWeb(query, timeoutMs) {
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
-
-    if (!response.ok) {
-      console.warn("Serper request failed with HTTP", response.status);
-      return "";
-    }
-
-    const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
-
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
-    if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
-    return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request did not finish in time; continuing without search.");
-    return "";
+    throw new Error(error?.name === "AbortError" ? "SERPER_TIMEOUT" : "SERPER_REQUEST_FAILED");
   }
+
+  const { response, data } = result;
+  if (!response.ok) {
+    const status = Number(response.status);
+    console.warn("Serper request failed with HTTP", status);
+    if (status === 401 || status === 403) throw new Error("SERPER_KEY_REJECTED");
+    if (status === 429) throw new Error("SERPER_QUOTA");
+    throw new Error("SERPER_REQUEST_FAILED");
+  }
+
+  const items = (Array.isArray(data.organic) ? data.organic : [])
+    .filter(item => item && (item.title || item.snippet))
+    .slice(0, 3)
+    .map((item, i) => {
+      const title = String(item.title || "").slice(0, 180);
+      const snippet = String(item.snippet || "").slice(0, 350);
+      const link = String(item.link || "").slice(0, 240);
+      return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
+    });
+
+  const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
+  if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
+  if (!items.length) throw new Error("SERPER_EMPTY_RESPONSE");
+  return items.join("\n");
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
@@ -182,6 +192,18 @@ function errorForUser(error) {
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "MISSING_SERPER_KEY":
+      return "Поиск в интернете пока не подключён. Нужно настроить ключ Serper на сервере навыка.";
+    case "SERPER_KEY_REJECTED":
+      return "Сервис поиска отклонил ключ доступа. Проверьте ключ Serper в настройках сервера.";
+    case "SERPER_QUOTA":
+      return "Сейчас исчерпан лимит запросов к поиску. Попробуйте позже.";
+    case "SERPER_TIMEOUT":
+      return "Поиск не успел ответить. Попробуйте повторить вопрос.";
+    case "SERPER_EMPTY_RESPONSE":
+      return "Поиск не нашёл подходящих результатов. Попробуйте уточнить запрос.";
+    case "SERPER_REQUEST_FAILED":
+      return "Сейчас не удалось выполнить поиск в интернете. Попробуйте ещё раз позже.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -220,17 +242,25 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
-    if (isSearchIntent(text) && (process.env.SERPER_API_KEY || process.env.SERPER_API)) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    if (isSearchIntent(text)) {
+      // Leave time for Gemini and keep the full response within Alice's deadline.
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 1800)));
     }
 
-    const answer = await askGemini(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
-    );
+    let answer;
+    try {
+      answer = await askGemini(
+        text,
+        oldHistory,
+        searchContext,
+        Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 300))
+      );
+    } catch (error) {
+      const timedOut = error?.name === "AbortError" || error?.message === "TIME_BUDGET_EXHAUSTED";
+      if (!searchContext || !timedOut) throw error;
+      console.warn("Gemini summary timed out; returning the search excerpts.");
+      answer = fitAliceText(`Вот что удалось найти: ${searchContext.replace(/https?:\/\/\S+/g, "").replace(/(^|\n)\d+\.\s*/g, "$1")}`);
+    }
 
     const history = [
       ...oldHistory,
@@ -240,7 +270,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
